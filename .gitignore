@@ -1,0 +1,43 @@
+# 🔐 Environment variables (أهم شيء)
+.env
+.env.*
+!.env.example
+
+# 📦 Node modules
+node_modules/
+
+# 🧾 Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 🗂️ Build / output
+dist/
+build/
+.out/
+
+# 💾 OS files
+.DS_Store
+Thumbs.db
+
+# 🧪 Testing
+coverage/
+
+# ⚙️ IDE / Editors
+.vscode/
+.idea/
+
+# 🔑 Keys / secrets (احتياط)
+*.pem
+*.key
+
+# ☁️ Cloud / uploads (لو تستخدم رفع صور)
+uploads/
+tmp/
+temp/
+
+# 🔥 Cache
+.cache/
+.next/
