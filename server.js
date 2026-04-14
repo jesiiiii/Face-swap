@@ -1,180 +1,209 @@
-const express = require(‘express’);
-const multer = require(‘multer’);
-const cors = require(‘cors’);
-const path = require(‘path’);
-const fs = require(‘fs’);
-const cloudinary = require(‘cloudinary’).v2;
-require(‘dotenv’).config();
+const express = require('express');
+const multer = require('multer');
+const cors = require('cors');
+const path = require('path');
+const cloudinary = require('cloudinary').v2;
+const streamifier = require('streamifier');
+const fetch = require('node-fetch');
+const rateLimit = require('express-rate-limit');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Cloudinary Configuration
+// ====================
+// ENV
+// ====================
+const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
+const API_SECRET = process.env.API_SECRET || "super-secret-key";
+
+// ====================
+// Cloudinary
+// ====================
 cloudinary.config({
-cloud_name: process.env.CLOUDINARY_CLOUD_NAME || '’,
-api_key: process.env.CLOUDINARY_API_KEY || ‘’,
-api_secret: process.env.CLOUDINARY_API_SECRET || ‘’
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-const UPLOAD_PRESET = process.env.CLOUDINARY_UPLOAD_PRESET || ‘Namiss’;
-const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN || ‘’;
-
-// Ensure directories exist
-const uploadDir = ‘./uploads’;
-const outputDir = ‘./outputs’;
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-
+// ====================
 // Middleware
+// ====================
 app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, ‘public’)));
+app.use(express.json({ limit: "50mb" }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Configure multer
-const storage = multer.diskStorage({
-destination: (req, file, cb) => cb(null, uploadDir),
-filename: (req, file, cb) => {
-const uniqueSuffix = Date.now() + ‘-’ + Math.round(Math.random() * 1E9);
-cb(null, uniqueSuffix + path.extname(file.originalname));
-}
-});
-
+// ====================
+// Multer (Memory)
+// ====================
 const upload = multer({
-storage: storage,
-limits: { fileSize: 100 * 1024 * 1024 } // 100MB
+    storage: multer.memoryStorage(),
+    limits: {
+        fileSize: 50 * 1024 * 1024 // 50MB
+    }
 });
 
 // ====================
-// API Routes
+// Rate Limit
 // ====================
-
-// Health check
-app.get(’/api/health’, (req, res) => {
-res.json({ status: ‘ok’, message: ‘Face Swap API is running’ });
+const faceSwapLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 5,
+    message: {
+        success: false,
+        error: "Too many requests, try later"
+    }
 });
 
-// Progress tracker
-let progressData = { percent: 0, status: ‘’ };
-function updateProgress(percent, status) {
-progressData = { percent, status };
+// ====================
+// API Key Middleware
+// ====================
+function checkApiKey(req, res, next) {
+    const key = req.headers['x-api-key'];
+
+    if (!key || key !== API_SECRET) {
+        return res.status(403).json({
+            success: false,
+            error: "Unauthorized"
+        });
+    }
+
+    next();
 }
 
-app.get(’/api/progress’, (req, res) => {
-res.json(progressData);
+// ====================
+// Cloudinary Upload
+// ====================
+function uploadToCloudinary(buffer, options = {}) {
+    return new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+            { resource_type: "auto", ...options },
+            (error, result) => {
+                if (error) return reject(error);
+                resolve(result);
+            }
+        );
+        streamifier.createReadStream(buffer).pipe(stream);
+    });
+}
+
+// ====================
+// Health
+// ====================
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', message: 'API running 🚀' });
 });
 
-// Face Swap: Cloudinary Upload + Replicate Processing
-app.post(’/api/face-swap’, upload.fields([
-{ name: ‘sourceImage’, maxCount: 1 },
-{ name: ‘targetVideo’, maxCount: 1 }
-]), async (req, res) => {
-try {
-const sourceFile = req.files[‘sourceImage’]?.[0];
-const targetFile = req.files[‘targetVideo’]?.[0];
+// ====================
+// Face Swap
+// ====================
+app.post('/api/face-swap',
+    checkApiKey,
+    faceSwapLimiter,
+    upload.fields([
+        { name: 'sourceImage', maxCount: 1 },
+        { name: 'targetVideo', maxCount: 1 }
+    ]),
+    async (req, res) => {
+        try {
+            const sourceFile = req.files['sourceImage']?.[0];
+            const targetFile = req.files['targetVideo']?.[0];
 
-```
-    if (!sourceFile || !targetFile) {
-        return res.status(400).json({
-            success: false,
-            error: 'Both source image and target video are required'
-        });
-    }
-
-    updateProgress(10, 'جاري رفع الصورة إلى Cloudinary...');
-
-    // Upload source image to Cloudinary
-    const sourceUpload = await cloudinary.uploader.upload(sourceFile.path, {
-        upload_preset: UPLOAD_PRESET,
-        folder: 'face-swap/source'
-    });
-
-    updateProgress(30, 'جاري رفع الفيديو إلى Cloudinary...');
-
-    // Upload target video to Cloudinary
-    const targetUpload = await cloudinary.uploader.upload(targetFile.path, {
-        upload_preset: UPLOAD_PRESET,
-        resource_type: 'video',
-        folder: 'face-swap/target'
-    });
-
-    updateProgress(50, 'جاري إرسال الطلب إلى Replicate...');
-
-    // Send URLs to Replicate for face swap
-    const response = await fetch('https://api.replicate.com/v1/predictions', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Token ${REPLICATE_API_TOKEN}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            version: "9a4f3b691b16a1ee42ca47e35dc3e302f2b71b9c5b7f66cf1f0d2aa80f90c1f3",
-            input: {
-                swap_image: sourceUpload.secure_url,
-                target_image: targetUpload.secure_url
+            if (!sourceFile || !targetFile) {
+                return res.status(400).json({
+                    success: false,
+                    error: "Image and video required"
+                });
             }
-        })
-    });
 
-    const prediction = await response.json();
+            console.log("📤 Uploading to Cloudinary...");
 
-    if (!prediction.id) {
-        throw new Error('Failed to start prediction');
-    }
+            const sourceUpload = await uploadToCloudinary(sourceFile.buffer, {
+                folder: "face-swap/source"
+            });
 
-    updateProgress(60, 'جاري معالجة استبدال الوجه...');
+            const targetUpload = await uploadToCloudinary(targetFile.buffer, {
+                resource_type: "video",
+                folder: "face-swap/target"
+            });
 
-    // Poll for result
-    let result = prediction;
-    while (result.status !== 'succeeded' && result.status !== 'failed') {
-        await new Promise(r => setTimeout(r, 2000));
-        const pollResponse = await fetch(`https://api.replicate.com/v1/predictions/${prediction.id}`, {
-            headers: { 'Authorization': `Token ${REPLICATE_API_TOKEN}` }
-        });
-        result = await pollResponse.json();
-        updateProgress(80, 'جاري الانتظار...');
-    }
+            console.log("🧠 Sending to Replicate...");
 
-    // Clean up local files
-    fs.unlinkSync(sourceFile.path);
-    fs.unlinkSync(targetFile.path);
+            const start = await fetch("https://api.replicate.com/v1/predictions", {
+                method: "POST",
+                headers: {
+                    "Authorization": `Token ${REPLICATE_API_TOKEN}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    version: "9a4f3b691b16a1ee42ca47e35dc3e302f2b71b9c5b7f66cf1f0d2aa80f90c1f3",
+                    input: {
+                        swap_image: sourceUpload.secure_url,
+                        target_video: targetUpload.secure_url
+                    }
+                })
+            });
 
-    if (result.status === 'failed') {
-        throw new Error(result.error || 'Face swap failed');
-    }
+            let prediction = await start.json();
 
-    updateProgress(100, 'اكتمل!');
+            if (!prediction.id) {
+                throw new Error("Failed to start AI job");
+            }
 
-    res.json({
-        success: true,
-        message: 'Face swap completed successfully',
-        result: {
-            videoUrl: result.output,
-            sourceUrl: sourceUpload.secure_url,
-            originalUrl: targetUpload.secure_url
+            console.log("⏳ Processing...");
+
+            // Polling
+            while (prediction.status !== "succeeded" && prediction.status !== "failed") {
+                await new Promise(r => setTimeout(r, 2000));
+
+                const poll = await fetch(`https://api.replicate.com/v1/predictions/${prediction.id}`, {
+                    headers: {
+                        "Authorization": `Token ${REPLICATE_API_TOKEN}`
+                    }
+                });
+
+                prediction = await poll.json();
+            }
+
+            if (prediction.status === "failed") {
+                throw new Error(prediction.error || "AI failed");
+            }
+
+            console.log("✅ Done");
+
+            res.json({
+                success: true,
+                result: {
+                    videoUrl: prediction.output,
+                    source: sourceUpload.secure_url,
+                    target: targetUpload.secure_url
+                }
+            });
+
+        } catch (err) {
+            console.error("❌ Error:", err);
+            res.status(500).json({
+                success: false,
+                error: err.message
+            });
         }
-    });
+    }
+);
 
-} catch (error) {
-    console.error('Face swap error:', error);
+// ====================
+// Error Handler
+// ====================
+app.use((err, req, res, next) => {
+    console.error(err);
     res.status(500).json({
         success: false,
-        error: error.message || 'Face swap processing failed'
+        error: err.message || "Server error"
     });
-}
-```
-
 });
 
-// Error handling
-app.use((err, req, res, next) => {
-console.error(‘Error:’, err);
-res.status(500).json({
-success: false,
-error: err.message || ‘Internal server error’
-});
-});
-
+// ====================
+// Start
+// ====================
 app.listen(PORT, () => {
-console.log(`Face Swap Server running on http://localhost:${PORT}`);
-console.log(`Cloud Name: ${cloudinary.config().cloud_name}`);
+    console.log(`🔥 Server running on port ${PORT}`);
 });
